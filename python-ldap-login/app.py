@@ -207,32 +207,35 @@ def ldap_test() -> str:
             add_log(logs, f"Attempting authentication with: {login_username}")
 
             use_ssl = port == 636
-            add_log(logs, f"SSL/TLS mode: {'LDAPS (implicit SSL)' if use_ssl else 'LDAP (plain or STARTTLS)'}")
+            add_log(logs, f"SSL/TLS mode: {'LDAPS (implicit SSL)' if use_ssl else 'LDAP (plain, no TLS)'}")
 
-            # Configure TLS options
-            if ca_cert_file:
-                add_log(logs, f"Loading CA certificate from: {ca_cert_file}")
-                try:
-                    with open(ca_cert_file, "r") as f:
-                        cert_content = f.read()
-                        if "BEGIN CERTIFICATE" in cert_content:
-                            add_log(logs, "CA certificate file format: PEM (valid)")
-                        else:
-                            add_log(logs, "WARNING: CA certificate may not be in PEM format", "error")
-                except FileNotFoundError:
-                    add_log(logs, f"ERROR: CA certificate file not found: {ca_cert_file}", "error")
-                except PermissionError:
-                    add_log(logs, f"ERROR: Cannot read CA certificate file (permission denied): {ca_cert_file}", "error")
+            # Configure TLS options only for LDAPS
+            if use_ssl:
+                if ca_cert_file:
+                    add_log(logs, f"Loading CA certificate from: {ca_cert_file}")
+                    try:
+                        with open(ca_cert_file, "r") as f:
+                            cert_content = f.read()
+                            if "BEGIN CERTIFICATE" in cert_content:
+                                add_log(logs, "CA certificate file format: PEM (valid)")
+                            else:
+                                add_log(logs, "WARNING: CA certificate may not be in PEM format", "error")
+                    except FileNotFoundError:
+                        add_log(logs, f"ERROR: CA certificate file not found: {ca_cert_file}", "error")
+                    except PermissionError:
+                        add_log(logs, f"ERROR: Cannot read CA certificate file (permission denied): {ca_cert_file}", "error")
 
-                # Set CA certificate file globally
-                ldap.set_option(ldap.OPT_X_TLS_CACERTFILE, ca_cert_file)
-                add_log(logs, f"Set OPT_X_TLS_CACERTFILE: {ca_cert_file}")
+                    # Set CA certificate file globally
+                    ldap.set_option(ldap.OPT_X_TLS_CACERTFILE, ca_cert_file)
+                    add_log(logs, f"Set OPT_X_TLS_CACERTFILE: {ca_cert_file}")
+                else:
+                    add_log(logs, "No CA certificate configured - using system certificates")
+
+                # Set TLS to DEMAND - require valid server certificate
+                ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_DEMAND)
+                add_log(logs, "Set OPT_X_TLS_REQUIRE_CERT: OPT_X_TLS_DEMAND (require valid certificate)")
             else:
-                add_log(logs, "No CA certificate configured - using system certificates")
-
-            # Set TLS to DEMAND - require valid server certificate
-            ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_DEMAND)
-            add_log(logs, "Set OPT_X_TLS_REQUIRE_CERT: OPT_X_TLS_DEMAND (require valid certificate)")
+                add_log(logs, "TLS disabled for plain LDAP connection")
 
             # DNS resolution check
             add_log(logs, f"Resolving hostname: {host}")
@@ -271,23 +274,18 @@ def ldap_test() -> str:
                 connection.set_option(ldap.OPT_NETWORK_TIMEOUT, 10.0)
                 add_log(logs, "Set network timeout: 10 seconds")
 
-                # Apply TLS settings to this connection as well
-                connection.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_DEMAND)
-                add_log(logs, "Connection-level OPT_X_TLS_REQUIRE_CERT: DEMAND")
+                # Apply TLS settings only for LDAPS
+                if use_ssl:
+                    connection.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_DEMAND)
+                    add_log(logs, "Connection-level OPT_X_TLS_REQUIRE_CERT: DEMAND")
 
-                if ca_cert_file:
-                    connection.set_option(ldap.OPT_X_TLS_CACERTFILE, ca_cert_file)
-                    add_log(logs, f"Connection-level OPT_X_TLS_CACERTFILE set")
+                    if ca_cert_file:
+                        connection.set_option(ldap.OPT_X_TLS_CACERTFILE, ca_cert_file)
+                        add_log(logs, "Connection-level OPT_X_TLS_CACERTFILE set")
 
-                # Force TLS context reload after setting options
-                connection.set_option(ldap.OPT_X_TLS_NEWCTX, 0)
-                add_log(logs, "TLS context reloaded with new options")
-
-                # STARTTLS for non-SSL connections
-                if not use_ssl:
-                    add_log(logs, "Starting TLS upgrade (STARTTLS)...")
-                    connection.start_tls_s()
-                    add_log(logs, "STARTTLS completed successfully", "success")
+                    # Force TLS context reload after setting options
+                    connection.set_option(ldap.OPT_X_TLS_NEWCTX, 0)
+                    add_log(logs, "TLS context reloaded with new options")
 
                 add_log(logs, f"Attempting LDAP bind for user: {login_username}")
                 connection.simple_bind_s(login_username, password)
