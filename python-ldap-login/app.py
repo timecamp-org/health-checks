@@ -231,8 +231,8 @@ def ldap_test() -> str:
                 add_log(logs, "No CA certificate configured - using system certificates")
 
             # Set TLS to DEMAND - require valid server certificate
-            ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_DEMAND)
-            add_log(logs, "Set OPT_X_TLS_REQUIRE_CERT: OPT_X_TLS_DEMAND (require valid certificate)")
+            ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_ALLOW)
+            add_log(logs, "Set OPT_X_TLS_REQUIRE_CERT: OPT_X_TLS_ALLOW (request cert, continue if invalid)")
 
             # DNS resolution check
             add_log(logs, f"Resolving hostname: {host}")
@@ -272,8 +272,8 @@ def ldap_test() -> str:
                 add_log(logs, "Set network timeout: 10 seconds")
 
                 # Apply TLS settings to this connection as well
-                connection.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_DEMAND)
-                add_log(logs, "Connection-level OPT_X_TLS_REQUIRE_CERT: DEMAND")
+                connection.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_ALLOW)
+                add_log(logs, "Connection-level OPT_X_TLS_REQUIRE_CERT: ALLOW")
 
                 if ca_cert_file:
                     connection.set_option(ldap.OPT_X_TLS_CACERTFILE, ca_cert_file)
