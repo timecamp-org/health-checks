@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import datetime
 import socket
-import ssl
 from dataclasses import dataclass
 from typing import Dict, List
 
 from flask import Flask, render_template_string, request
 
 try:
-    from ldap3 import Connection, Server, Tls
-    from ldap3.core.exceptions import LDAPException, LDAPSocketOpenError
+    import ldap
 except ImportError as exc:
     raise SystemExit(
         "Missing dependency. Run: pip install -r python-ldap-login/requirements.txt"
@@ -211,7 +209,7 @@ def ldap_test() -> str:
             use_ssl = port == 636
             add_log(logs, f"SSL/TLS mode: {'LDAPS (implicit SSL)' if use_ssl else 'LDAP (plain or STARTTLS)'}")
 
-            tls_config = None
+            # Configure TLS options
             if ca_cert_file:
                 add_log(logs, f"Loading CA certificate from: {ca_cert_file}")
                 try:
@@ -225,10 +223,16 @@ def ldap_test() -> str:
                     add_log(logs, f"ERROR: CA certificate file not found: {ca_cert_file}", "error")
                 except PermissionError:
                     add_log(logs, f"ERROR: Cannot read CA certificate file (permission denied): {ca_cert_file}", "error")
-                tls_config = Tls(ca_certs_file=ca_cert_file, validate=ssl.CERT_REQUIRED)
-                add_log(logs, "TLS config created with CERT_REQUIRED validation")
+
+                # Set CA certificate file globally
+                ldap.set_option(ldap.OPT_X_TLS_CACERTFILE, ca_cert_file)
+                add_log(logs, f"Set OPT_X_TLS_CACERTFILE: {ca_cert_file}")
             else:
                 add_log(logs, "No CA certificate configured - using system certificates")
+
+            # Set TLS to DEMAND - require valid server certificate
+            ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_DEMAND)
+            add_log(logs, "Set OPT_X_TLS_REQUIRE_CERT: OPT_X_TLS_DEMAND (require valid certificate)")
 
             # DNS resolution check
             add_log(logs, f"Resolving hostname: {host}")
@@ -252,63 +256,66 @@ def ldap_test() -> str:
 
             connection = None
             try:
-                add_log(logs, f"Creating LDAP server object: {host}:{port} (use_ssl={use_ssl})")
-                server = Server(host, port=port, use_ssl=use_ssl, tls=tls_config, connect_timeout=10)
-                add_log(logs, "LDAP Server object created")
+                # Build LDAP URI
+                protocol = "ldaps" if use_ssl else "ldap"
+                ldap_uri = f"{protocol}://{host}:{port}"
+                add_log(logs, f"Initializing LDAP connection: {ldap_uri}")
 
-                add_log(logs, f"Creating LDAP connection for user: {login_username}")
-                connection = Connection(
-                    server,
-                    user=login_username,
-                    password=password,
-                    auto_bind=False,
-                    raise_exceptions=True,
-                )
-                add_log(logs, "LDAP Connection object created")
+                connection = ldap.initialize(ldap_uri)
+                add_log(logs, "LDAP connection initialized")
 
-                add_log(logs, "Attempting to open LDAP connection...")
-                connection.open()
-                add_log(logs, f"LDAP connection established ({host}:{port})", "success")
+                # Set connection options
+                connection.set_option(ldap.OPT_PROTOCOL_VERSION, 3)
+                add_log(logs, "Set protocol version: LDAPv3")
 
-                if tls_config and not use_ssl:
+                connection.set_option(ldap.OPT_NETWORK_TIMEOUT, 10.0)
+                add_log(logs, "Set network timeout: 10 seconds")
+
+                # Apply TLS settings to this connection as well
+                connection.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_DEMAND)
+                add_log(logs, "Connection-level OPT_X_TLS_REQUIRE_CERT: DEMAND")
+
+                if ca_cert_file:
+                    connection.set_option(ldap.OPT_X_TLS_CACERTFILE, ca_cert_file)
+                    add_log(logs, f"Connection-level OPT_X_TLS_CACERTFILE set")
+
+                # Force TLS context reload after setting options
+                connection.set_option(ldap.OPT_X_TLS_NEWCTX, 0)
+                add_log(logs, "TLS context reloaded with new options")
+
+                # STARTTLS for non-SSL connections
+                if not use_ssl:
                     add_log(logs, "Starting TLS upgrade (STARTTLS)...")
-                    if connection.start_tls():
-                        add_log(logs, "TLS started successfully", "success")
-                    else:
-                        add_log(
-                            logs,
-                            f"ERROR: Could not start TLS - {connection.last_error}",
-                            "error",
-                        )
+                    connection.start_tls_s()
+                    add_log(logs, "STARTTLS completed successfully", "success")
 
-                add_log(logs, "Attempting LDAP bind (authentication)...")
-                if connection.bind():
-                    add_log(logs, "SUCCESS: User authenticated successfully!", "success")
-                    add_log(logs, f"Bind result: {connection.result}")
-                else:
-                    diagnostic = connection.result.get("message") or connection.last_error
-                    add_log(
-                        logs,
-                        f"ERROR: Authentication failed - {diagnostic}",
-                        "error",
-                    )
-                    add_log(logs, f"Full result: {connection.result}", "error")
+                add_log(logs, f"Attempting LDAP bind for user: {login_username}")
+                connection.simple_bind_s(login_username, password)
+                add_log(logs, "SUCCESS: User authenticated successfully!", "success")
 
-            except LDAPSocketOpenError as exc:
-                add_log(logs, f"ERROR: Could not open LDAP socket", "error")
-                add_log(logs, f"Socket error details: {exc}", "error")
+            except ldap.INVALID_CREDENTIALS:
+                add_log(logs, "ERROR: Invalid credentials - authentication failed", "error")
+            except ldap.SERVER_DOWN as exc:
+                add_log(logs, f"ERROR: LDAP server is down or unreachable", "error")
+                add_log(logs, f"Details: {exc}", "error")
                 if "certificate" in str(exc).lower():
                     add_log(logs, "HINT: This may be a TLS/SSL certificate issue", "error")
-                if "connect" in str(exc).lower():
-                    add_log(logs, "HINT: Server may be unreachable or port may be blocked", "error")
-            except LDAPException as exc:
-                add_log(logs, f"LDAP EXCEPTION: {type(exc).__name__}", "error")
-                add_log(logs, f"Error details: {exc}", "error")
-            except ssl.SSLError as exc:
-                add_log(logs, f"SSL ERROR: {exc}", "error")
-                add_log(logs, f"SSL error code: {exc.reason}", "error")
-                if exc.reason == "CERTIFICATE_VERIFY_FAILED":
-                    add_log(logs, "HINT: Server certificate validation failed. Check CA certificate.", "error")
+            except ldap.CONNECT_ERROR as exc:
+                add_log(logs, f"ERROR: Could not connect to LDAP server", "error")
+                add_log(logs, f"Details: {exc}", "error")
+            except ldap.TIMEOUT:
+                add_log(logs, "ERROR: LDAP operation timed out", "error")
+            except ldap.LDAPError as exc:
+                add_log(logs, f"LDAP ERROR: {type(exc).__name__}", "error")
+                error_info = exc.args[0] if exc.args else {}
+                if isinstance(error_info, dict):
+                    desc = error_info.get("desc", "Unknown error")
+                    info = error_info.get("info", "")
+                    add_log(logs, f"Description: {desc}", "error")
+                    if info:
+                        add_log(logs, f"Info: {info}", "error")
+                else:
+                    add_log(logs, f"Error details: {exc}", "error")
             except socket.timeout:
                 add_log(logs, "ERROR: Connection timed out", "error")
             except OSError as exc:
@@ -317,7 +324,7 @@ def ldap_test() -> str:
             finally:
                 if connection:
                     try:
-                        connection.unbind()
+                        connection.unbind_s()
                         add_log(logs, "LDAP connection closed")
                     except Exception:
                         add_log(logs, "LDAP connection cleanup (no active connection)")
