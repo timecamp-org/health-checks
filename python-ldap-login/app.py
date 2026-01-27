@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import socket
 import ssl
 from dataclasses import dataclass
 from typing import Dict, List
@@ -9,7 +10,7 @@ from flask import Flask, render_template_string, request
 
 try:
     from ldap3 import Connection, Server, Tls
-    from ldap3.core.exceptions import LDAPException
+    from ldap3.core.exceptions import LDAPException, LDAPSocketOpenError
 except ImportError as exc:
     raise SystemExit(
         "Missing dependency. Run: pip install -r python-ldap-login/requirements.txt"
@@ -208,53 +209,120 @@ def ldap_test() -> str:
             add_log(logs, f"Attempting authentication with: {login_username}")
 
             use_ssl = port == 636
+            add_log(logs, f"SSL/TLS mode: {'LDAPS (implicit SSL)' if use_ssl else 'LDAP (plain or STARTTLS)'}")
+
             tls_config = None
             if ca_cert_file:
+                add_log(logs, f"Loading CA certificate from: {ca_cert_file}")
+                try:
+                    with open(ca_cert_file, "r") as f:
+                        cert_content = f.read()
+                        if "BEGIN CERTIFICATE" in cert_content:
+                            add_log(logs, "CA certificate file format: PEM (valid)")
+                        else:
+                            add_log(logs, "WARNING: CA certificate may not be in PEM format", "error")
+                except FileNotFoundError:
+                    add_log(logs, f"ERROR: CA certificate file not found: {ca_cert_file}", "error")
+                except PermissionError:
+                    add_log(logs, f"ERROR: Cannot read CA certificate file (permission denied): {ca_cert_file}", "error")
                 tls_config = Tls(ca_certs_file=ca_cert_file, validate=ssl.CERT_REQUIRED)
+                add_log(logs, "TLS config created with CERT_REQUIRED validation")
+            else:
+                add_log(logs, "No CA certificate configured - using system certificates")
 
+            # DNS resolution check
+            add_log(logs, f"Resolving hostname: {host}")
             try:
-                server = Server(host, port=port, use_ssl=use_ssl, tls=tls_config)
+                ip_addresses = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+                resolved_ips = list(set([addr[4][0] for addr in ip_addresses]))
+                add_log(logs, f"DNS resolved to: {', '.join(resolved_ips)}")
+            except socket.gaierror as dns_err:
+                add_log(logs, f"ERROR: DNS resolution failed - {dns_err}", "error")
+
+            # TCP connectivity check
+            add_log(logs, f"Testing TCP connectivity to {host}:{port}")
+            try:
+                test_socket = socket.create_connection((host, port), timeout=10)
+                add_log(logs, f"TCP connection successful to {host}:{port}")
+                test_socket.close()
+            except socket.timeout:
+                add_log(logs, f"ERROR: TCP connection timed out to {host}:{port}", "error")
+            except socket.error as sock_err:
+                add_log(logs, f"ERROR: TCP connection failed - {sock_err}", "error")
+
+            connection = None
+            try:
+                add_log(logs, f"Creating LDAP server object: {host}:{port} (use_ssl={use_ssl})")
+                server = Server(host, port=port, use_ssl=use_ssl, tls=tls_config, connect_timeout=10)
+                add_log(logs, "LDAP Server object created")
+
+                add_log(logs, f"Creating LDAP connection for user: {login_username}")
                 connection = Connection(
                     server,
                     user=login_username,
                     password=password,
                     auto_bind=False,
+                    raise_exceptions=True,
                 )
+                add_log(logs, "LDAP Connection object created")
 
-                if not connection.open():
-                    add_log(logs, "ERROR: Could not connect to LDAP server", "error")
-                else:
-                    add_log(logs, f"LDAP connection established ({host}:{port})")
+                add_log(logs, "Attempting to open LDAP connection...")
+                connection.open()
+                add_log(logs, f"LDAP connection established ({host}:{port})", "success")
 
-                    if tls_config and not use_ssl:
-                        if connection.start_tls():
-                            add_log(logs, "TLS started successfully")
-                        else:
-                            add_log(
-                                logs,
-                                f"ERROR: Could not start TLS - {connection.last_error}",
-                                "error",
-                            )
-
-                    if connection.bind():
-                        add_log(logs, "SUCCESS: User authenticated successfully!", "success")
+                if tls_config and not use_ssl:
+                    add_log(logs, "Starting TLS upgrade (STARTTLS)...")
+                    if connection.start_tls():
+                        add_log(logs, "TLS started successfully", "success")
                     else:
-                        diagnostic = connection.result.get("message") or connection.last_error
                         add_log(
                             logs,
-                            f"ERROR: Authentication failed - {diagnostic}",
+                            f"ERROR: Could not start TLS - {connection.last_error}",
                             "error",
                         )
+
+                add_log(logs, "Attempting LDAP bind (authentication)...")
+                if connection.bind():
+                    add_log(logs, "SUCCESS: User authenticated successfully!", "success")
+                    add_log(logs, f"Bind result: {connection.result}")
+                else:
+                    diagnostic = connection.result.get("message") or connection.last_error
+                    add_log(
+                        logs,
+                        f"ERROR: Authentication failed - {diagnostic}",
+                        "error",
+                    )
+                    add_log(logs, f"Full result: {connection.result}", "error")
+
+            except LDAPSocketOpenError as exc:
+                add_log(logs, f"ERROR: Could not open LDAP socket", "error")
+                add_log(logs, f"Socket error details: {exc}", "error")
+                if "certificate" in str(exc).lower():
+                    add_log(logs, "HINT: This may be a TLS/SSL certificate issue", "error")
+                if "connect" in str(exc).lower():
+                    add_log(logs, "HINT: Server may be unreachable or port may be blocked", "error")
             except LDAPException as exc:
-                add_log(logs, f"EXCEPTION: {exc}", "error")
+                add_log(logs, f"LDAP EXCEPTION: {type(exc).__name__}", "error")
+                add_log(logs, f"Error details: {exc}", "error")
+            except ssl.SSLError as exc:
+                add_log(logs, f"SSL ERROR: {exc}", "error")
+                add_log(logs, f"SSL error code: {exc.reason}", "error")
+                if exc.reason == "CERTIFICATE_VERIFY_FAILED":
+                    add_log(logs, "HINT: Server certificate validation failed. Check CA certificate.", "error")
+            except socket.timeout:
+                add_log(logs, "ERROR: Connection timed out", "error")
             except OSError as exc:
-                add_log(logs, f"EXCEPTION: {exc}", "error")
+                add_log(logs, f"OS ERROR: {exc}", "error")
+                add_log(logs, f"Error number: {exc.errno}", "error")
             finally:
-                try:
-                    connection.unbind()
-                    add_log(logs, "LDAP connection closed")
-                except Exception:
-                    pass
+                if connection:
+                    try:
+                        connection.unbind()
+                        add_log(logs, "LDAP connection closed")
+                    except Exception:
+                        add_log(logs, "LDAP connection cleanup (no active connection)")
+                else:
+                    add_log(logs, "No LDAP connection was established")
 
     return render_template_string(
         HTML_TEMPLATE,
