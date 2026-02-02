@@ -6,7 +6,7 @@ This repo contains small health-check utilities.
 
 Run the LDAP test page:
 
-```
+```sh
 cp php-ldap-login/.env.sample php-ldap-login/.env
 php -S 127.0.0.1:8000 -t php-ldap-login
 ```
@@ -17,7 +17,7 @@ Then open `http://127.0.0.1:8000/`.
 
 Run the LDAP test page:
 
-```
+```sh
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r python-ldap-login/requirements.txt

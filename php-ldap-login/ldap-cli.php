@@ -121,14 +121,159 @@ function authenticateLdapUser($ad, string $username, string $password): array
         return [true, ''];
     }
 
-    $error = "Couldn't authenticate LDAP user $username. " . ldap_error($ad);
-    $diagnostic = '';
-    ldap_get_option($ad, LDAP_OPT_DIAGNOSTIC_MESSAGE, $diagnostic);
-    if ($diagnostic !== '') {
-        $error .= ' | Diagnostic: ' . $diagnostic;
-    }
+    $error = "Couldn't authenticate LDAP user $username. " . formatLdapErrorDetails($ad);
 
     return [false, $error];
+}
+
+function formatLdapErrorDetails($ad): string
+{
+    $error = ldap_error($ad);
+    $errno = ldap_errno($ad);
+    $diagnostic = '';
+    $errorString = '';
+
+    ldap_get_option($ad, LDAP_OPT_DIAGNOSTIC_MESSAGE, $diagnostic);
+    if (defined('LDAP_OPT_ERROR_STRING')) {
+        ldap_get_option($ad, LDAP_OPT_ERROR_STRING, $errorString);
+    }
+
+    $parts = [];
+    if ($error !== '') {
+        $parts[] = $error;
+    }
+    if ($errno !== 0) {
+        $parts[] = 'errno=' . $errno;
+    }
+    if ($diagnostic !== '') {
+        $parts[] = 'diagnostic=' . $diagnostic;
+    }
+    if ($errorString !== '' && $errorString !== $error) {
+        $parts[] = 'error_string=' . $errorString;
+    }
+
+    return implode('; ', $parts);
+}
+
+function logCaCertDetails(string $path, callable $addLog): void
+{
+    if ($path === '') {
+        $addLog('No CA certificate configured - using system certificates');
+        return;
+    }
+
+    if (!is_file($path)) {
+        $addLog('ERROR: CA certificate file not found: ' . $path);
+        return;
+    }
+
+    if (!is_readable($path)) {
+        $addLog('ERROR: Cannot read CA certificate file (permission denied): ' . $path);
+        return;
+    }
+
+    $contents = file_get_contents($path);
+    if ($contents === false) {
+        $addLog('ERROR: Failed reading CA certificate file: ' . $path);
+        return;
+    }
+
+    if (strpos($contents, 'BEGIN CERTIFICATE') !== false) {
+        $addLog('CA certificate file format: PEM (valid)');
+    } else {
+        $addLog('WARNING: CA certificate may not be in PEM format');
+    }
+}
+
+function testDnsResolution(string $host, callable $addLog): void
+{
+    $addLog('Resolving hostname: ' . $host);
+
+    $ips = [];
+    if (function_exists('dns_get_record')) {
+        $records = @dns_get_record($host, DNS_A | DNS_AAAA);
+        if (is_array($records)) {
+            foreach ($records as $record) {
+                if (!empty($record['ip'])) {
+                    $ips[] = $record['ip'];
+                } elseif (!empty($record['ipv6'])) {
+                    $ips[] = $record['ipv6'];
+                }
+            }
+        }
+    }
+
+    if (empty($ips) && function_exists('gethostbynamel')) {
+        $resolved = @gethostbynamel($host);
+        if (is_array($resolved)) {
+            $ips = array_merge($ips, $resolved);
+        }
+    }
+
+    $ips = array_values(array_unique(array_filter($ips)));
+    if (empty($ips)) {
+        $addLog('ERROR: DNS resolution failed');
+        return;
+    }
+
+    $addLog('DNS resolved to: ' . implode(', ', $ips));
+}
+
+function testTcpConnectivity(string $host, int $port, callable $addLog): void
+{
+    $addLog('Testing TCP connectivity to ' . $host . ':' . $port);
+
+    $errno = 0;
+    $errstr = '';
+    $start = microtime(true);
+    $socket = @stream_socket_client('tcp://' . $host . ':' . $port, $errno, $errstr, 10);
+    $elapsedMs = (microtime(true) - $start) * 1000;
+
+    if ($socket) {
+        fclose($socket);
+        $addLog('TCP connection successful to ' . $host . ':' . $port . sprintf(' (%.0fms)', $elapsedMs));
+        return;
+    }
+
+    if ($errno === 110) {
+        $addLog('ERROR: TCP connection timed out to ' . $host . ':' . $port . sprintf(' (%.0fms)', $elapsedMs));
+        return;
+    }
+
+    $detail = $errstr !== '' ? $errstr : 'Unknown socket error';
+    $addLog('ERROR: TCP connection failed - ' . $detail . ' (errno=' . $errno . ')');
+}
+
+function runFailureDiagnostics(array $adConfig, callable $addLog, string $label): void
+{
+    $addLog('--- Additional diagnostics (' . $label . ') ---');
+
+    $isLdaps = $adConfig['port'] === 636;
+    $tlsAllowInsecure = $adConfig['tls_allow_insecure'];
+
+    $addLog('TLS mode: ' . ($isLdaps ? 'LDAPS (implicit SSL)' : 'LDAP (plain, no TLS)'));
+    logCaCertDetails($adConfig['ca_cert_file'], $addLog);
+
+    if ($adConfig['ca_cert_file'] !== '') {
+        $addLog('Planned OPT_X_TLS_CACERTFILE: ' . $adConfig['ca_cert_file']);
+        $addLog('Planned OPT_X_TLS_REQUIRE_CERT: HARD');
+    } elseif ($isLdaps && $tlsAllowInsecure) {
+        $addLog('Planned OPT_X_TLS_REQUIRE_CERT: ALLOW');
+    } elseif ($isLdaps) {
+        $addLog('Planned OPT_X_TLS_REQUIRE_CERT: HARD (default)');
+    } else {
+        $addLog('TLS disabled for plain LDAP connection');
+    }
+
+    $portForChecks = $adConfig['port'] ?? 389;
+    if ($adConfig['port'] === null) {
+        $addLog('No LDAP port configured, using default 389 for connectivity checks.');
+    }
+
+    if ($adConfig['host'] !== '') {
+        testDnsResolution($adConfig['host'], $addLog);
+        testTcpConnectivity($adConfig['host'], $portForChecks, $addLog);
+    }
 }
 
 function checkAdCredential(string $username, string $password, array $adConfig, callable $addLog): bool
@@ -150,13 +295,20 @@ function checkAdCredential(string $username, string $password, array $adConfig, 
         return false;
     }
 
-    $addLog('LDAP connection established');
+    // $addLog('LDAP connection established');
 
     ldap_set_option($ad, LDAP_OPT_PROTOCOL_VERSION, 3);
+    ldap_set_option($ad, LDAP_OPT_REFERRALS, 0);
+    $addLog('Set protocol version: LDAPv3');
+    $addLog('Set referrals: off');
+    if (defined('LDAP_OPT_NETWORK_TIMEOUT')) {
+        ldap_set_option($ad, LDAP_OPT_NETWORK_TIMEOUT, 10);
+        $addLog('Set network timeout: 10 seconds');
+    }
 
     if ($adConfig['ca_cert_file'] !== '') {
         if (!ldap_start_tls($ad)) {
-            $addLog('ERROR: Could not start TLS - ' . ldap_error($ad));
+            $addLog('ERROR: Could not start TLS - ' . formatLdapErrorDetails($ad));
             return false;
         }
         $addLog('TLS started successfully');
@@ -249,19 +401,56 @@ function checkAdCredential(string $username, string $password, array $adConfig, 
     return false;
 }
 
-$debugLog = [];
-$addLog = function (string $message) use (&$debugLog): void {
-    $debugLog[] = date('[Y-m-d H:i:s] ') . $message;
+function promptLine(string $label): string
+{
+    if (function_exists('readline')) {
+        $value = readline($label);
+        return trim($value ?? '');
+    }
+
+    echo $label;
+    $value = fgets(STDIN);
+    return trim($value ?? '');
+}
+
+function promptPassword(string $label): string
+{
+    if (function_exists('posix_isatty') && posix_isatty(STDIN)) {
+        echo $label;
+        $sttyMode = shell_exec('stty -g');
+        shell_exec('stty -echo');
+        $value = fgets(STDIN);
+        if (is_string($sttyMode)) {
+            shell_exec('stty ' . trim($sttyMode));
+        } else {
+            shell_exec('stty echo');
+        }
+        echo PHP_EOL;
+        return trim($value ?? '');
+    }
+
+    return promptLine($label);
+}
+
+$addLog = function (string $message): void {
+    echo date('[Y-m-d H:i:s] ') . $message . PHP_EOL;
 };
 
-$addLog('LDAP Test Started');
+$addLog('LDAP CLI Test Started');
 
 if (!function_exists('ldap_connect')) {
     $addLog('ERROR: PHP LDAP extension is not enabled.');
+    exit(1);
 }
 
 $env = loadEnvFile(__DIR__ . '/.env');
-$port = parsePort(trim($env['TC2_CONFIG_LDAP_PORT'] ?? ''));
+$portRaw = trim($env['TC2_CONFIG_LDAP_PORT'] ?? '');
+$port = parsePort($portRaw);
+
+if ($portRaw !== '' && $port === null) {
+    $addLog('ERROR: Invalid LDAP port: ' . $portRaw);
+}
+
 $adConfig = [
     'host' => trim($env['TC2_CONFIG_LDAP_HOST'] ?? ''),
     'port' => $port,
@@ -278,148 +467,35 @@ $addLog('AD Config - Domain: ' . ($adConfig['domain'] !== '' ? $adConfig['domain
 $addLog('AD Config - Port: ' . ($adConfig['port'] !== null ? $adConfig['port'] : 'N/A'));
 
 if ($adConfig['ca_cert_file'] !== '') {
-    ldap_set_option(null, LDAP_OPT_X_TLS_REQUIRE_CERT, LDAP_OPT_X_TLS_HARD);
-    ldap_set_option(null, LDAP_OPT_X_TLS_CACERTFILE, $adConfig['ca_cert_file']);
     $addLog('CA cert file configured: ' . $adConfig['ca_cert_file']);
-}
-
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && function_exists('ldap_connect')) {
-    $username = trim($_POST['username'] ?? '');
-    $password = $_POST['password'] ?? '';
-    $password = html_entity_decode($password);
-
-    $addLog('Attempting to authenticate user: ' . htmlspecialchars($username));
-
-    try {
-        if ($adConfig['host'] === '') {
-            $addLog('ERROR: LDAP host missing in .env');
-        } elseif ($username === '' || $password === '') {
-            $addLog('ERROR: Username or password missing');
-        } else {
-            $result = checkAdCredential($username, $password, $adConfig, $addLog);
-            if ($result) {
-                $addLog('SUCCESS: User authenticated successfully!');
-            }
-        }
-    } catch (Throwable $e) {
-        $addLog('EXCEPTION: ' . $e->getMessage());
-        $addLog('Trace: ' . $e->getTraceAsString());
+    if (!is_file($adConfig['ca_cert_file'])) {
+        $addLog('WARNING: CA cert file not found on disk.');
     }
 }
 
-?>
-<!DOCTYPE html>
-<html>
-<head>
-    <title>LDAP Authentication Test</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 800px;
-            margin: 50px auto;
-            padding: 20px;
-            background-color: #f5f5f5;
-        }
-        .container {
-            background: white;
-            padding: 30px;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-        h1 {
-            color: #333;
-            margin-bottom: 30px;
-        }
-        .form-group {
-            margin-bottom: 20px;
-        }
-        label {
-            display: block;
-            margin-bottom: 5px;
-            font-weight: bold;
-            color: #555;
-        }
-        input[type="text"],
-        input[type="password"] {
-            width: 100%;
-            padding: 10px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            font-size: 14px;
-            box-sizing: border-box;
-        }
-        button {
-            background-color: #4CAF50;
-            color: white;
-            padding: 12px 30px;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 16px;
-        }
-        button:hover {
-            background-color: #45a049;
-        }
-        .debug-log {
-            background-color: #1e1e1e;
-            color: #d4d4d4;
-            padding: 20px;
-            border-radius: 4px;
-            font-family: 'Courier New', monospace;
-            font-size: 12px;
-            margin-top: 30px;
-            overflow-x: auto;
-        }
-        .debug-log pre {
-            margin: 0;
-            white-space: pre-wrap;
-            word-wrap: break-word;
-        }
-        .log-entry {
-            margin: 5px 0;
-        }
-        .success {
-            color: #4CAF50;
-        }
-        .error {
-            color: #f44336;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>LDAP / Active Directory Authentication Test</h1>
+$username = promptLine('Username: ');
+$password = promptPassword('Password: ');
 
-        <form method="POST" action="">
-            <div class="form-group">
-                <label for="username">Username:</label>
-                <input type="text" id="username" name="username" placeholder="user or user@domain.com" value="<?php echo htmlspecialchars($_POST['username'] ?? ''); ?>" required>
-            </div>
+$addLog('Attempting to authenticate user: ' . $username);
 
-            <div class="form-group">
-                <label for="password">Password:</label>
-                <input type="password" id="password" name="password" required>
-            </div>
+if ($adConfig['host'] === '' && $alternativeConfig['host'] === '') {
+    $addLog('ERROR: LDAP host missing in .env');
+    exit(1);
+}
 
-            <button type="submit">Test Authentication</button>
-        </form>
+if ($username === '' || $password === '') {
+    $addLog('ERROR: Username or password missing');
+    exit(1);
+}
 
-        <?php if (!empty($debugLog)): ?>
-        <div class="debug-log">
-            <strong style="display: block; margin-bottom: 10px; color: #fff;">Debug Log:</strong>
-            <pre><?php
-            foreach ($debugLog as $log) {
-                $class = '';
-                if (stripos($log, 'ERROR') !== false || stripos($log, 'EXCEPTION') !== false) {
-                    $class = 'error';
-                } elseif (stripos($log, 'SUCCESS') !== false) {
-                    $class = 'success';
-                }
-                echo '<div class="log-entry ' . $class . '">' . htmlspecialchars($log) . '</div>';
-            }
-            ?></pre>
-        </div>
-        <?php endif; ?>
-    </div>
-</body>
-</html>
+$result = checkAdCredential($username, $password, $adConfig, $addLog);
+if ($result) {
+    $addLog('SUCCESS: User authenticated successfully!');
+    exit(0);
+}
+
+$addLog('Running post-failure diagnostics.');
+runFailureDiagnostics($adConfig, $addLog, 'primary config');
+
+$addLog('ERROR: Authentication failed.');
+exit(2);
