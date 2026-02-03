@@ -13,6 +13,17 @@ php -S 127.0.0.1:8000 -t php-ldap-login
 
 Then open `http://127.0.0.1:8000/`.
 
+## PHP SMTP
+
+Run the SMTP CLI script:
+
+```sh
+cd php-smtp
+composer require phpmailer/phpmailer
+cp .env.sample .env
+php index.php
+```
+
 ## Python LDAP Login
 
 Run the LDAP test page:
